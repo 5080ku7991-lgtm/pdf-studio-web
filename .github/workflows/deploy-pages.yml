@@ -1,0 +1,86 @@
+name: Deploy PDF Studio Browser PWA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build public PWA
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf _site
+          mkdir -p _site/vendor/{fonts,tessdata,tesseract-core}
+          base64 -d pwa/index.html.gz.b64 | gzip -dc > _site/index.html
+          touch _site/.nojekyll
+          cat > _site/manifest.webmanifest <<'EOF'
+          {
+            "name":"PDF Studio Browser PWA 6.0",
+            "short_name":"PDF Studio",
+            "start_url":"./index.html",
+            "scope":"./",
+            "display":"standalone",
+            "background_color":"#eef1f5",
+            "theme_color":"#18212f",
+            "description":"PDFデータをブラウザ内で処理するオフライン対応PDF編集PWA"
+          }
+          EOF
+          V=_site/vendor
+          curl --fail --location --retry 3 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js' -o "$V/pdf.min.js"
+          curl --fail --location --retry 3 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js' -o "$V/pdf.worker.min.js"
+          curl --fail --location --retry 3 'https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js' -o "$V/pdf-lib.min.js"
+          curl --fail --location --retry 3 'https://cdn.jsdelivr.net/npm/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js' -o "$V/fontkit.umd.min.js"
+          curl --fail --location --retry 3 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js' -o "$V/tesseract.min.js"
+          curl --fail --location --retry 3 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/worker.min.js' -o "$V/tesseract-worker.min.js"
+          curl --fail --location --retry 3 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5/tesseract-core.wasm.js' -o "$V/tesseract-core/tesseract-core.wasm.js"
+          curl --fail --location --retry 3 'https://tessdata.projectnaptha.com/4.0.0/jpn.traineddata.gz' -o "$V/tessdata/jpn.traineddata.gz"
+          curl --fail --location --retry 3 'https://tessdata.projectnaptha.com/4.0.0/eng.traineddata.gz' -o "$V/tessdata/eng.traineddata.gz"
+          curl --fail --location --retry 3 'https://raw.githubusercontent.com/notofonts/noto-cjk/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf' -o "$V/fonts/NotoSansCJKjp-Regular.otf"
+          python3 - <<'PY'
+          import base64, pathlib, re
+          root=pathlib.Path('_site'); v=root/'vendor'
+          (v/'pdf-worker-data.js').write_text('window.__PDF_WORKER_B64="'+base64.b64encode((v/'pdf.worker.min.js').read_bytes()).decode()+'";',encoding='utf-8')
+          (v/'font-jp-data.js').write_text('window.__JP_FONT_B64="'+base64.b64encode((v/'fonts/NotoSansCJKjp-Regular.otf').read_bytes()).decode()+'";',encoding='utf-8')
+          ocr='window.__OCR_WORKER_B64="'+base64.b64encode((v/'tesseract-worker.min.js').read_bytes()).decode()+'";\n'
+          ocr+='window.__OCR_CORE_B64="'+base64.b64encode((v/'tesseract-core/tesseract-core.wasm.js').read_bytes()).decode()+'";\n'
+          ocr+='window.__OCR_JPN_B64="'+base64.b64encode((v/'tessdata/jpn.traineddata.gz').read_bytes()).decode()+'";\n'
+          ocr+='window.__OCR_ENG_B64="'+base64.b64encode((v/'tessdata/eng.traineddata.gz').read_bytes()).decode()+'";\n'
+          (v/'ocr-data.js').write_text(ocr,encoding='utf-8')
+          html=(root/'index.html').read_text(encoding='utf-8')
+          if re.search(r'<script[^>]+src=["\']https?://|fetch\(["\']https?://', html, re.I):
+              raise SystemExit('External runtime reference found in index.html')
+          PY
+          cat > _site/sw.js <<'EOF'
+          const CACHE='pdfstudio-pwa-6.0-v3';
+          const ASSETS=['./index.html','./manifest.webmanifest','./vendor/pdf.min.js','./vendor/pdf-lib.min.js','./vendor/fontkit.umd.min.js','./vendor/tesseract.min.js','./vendor/pdf-worker-data.js','./vendor/font-jp-data.js','./vendor/ocr-data.js'];
+          self.addEventListener('install',e=>e.waitUntil((async()=>{const c=await caches.open(CACHE);for(const a of ASSETS){try{await c.add(a)}catch(err){console.error('cache failed',a,err);throw err}}await self.skipWaiting()})()));
+          self.addEventListener('activate',e=>e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim())));
+          self.addEventListener('fetch',e=>{if(e.request.method!=='GET')return;e.respondWith(caches.match(e.request).then(hit=>hit||fetch(e.request).then(r=>{if(r.ok&&new URL(e.request.url).origin===location.origin){const q=r.clone();caches.open(CACHE).then(c=>c.put(e.request,q));}return r;})))});
+          EOF
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
